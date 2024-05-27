@@ -3,6 +3,7 @@
 #include <Adafruit_SSD1306.h>
 #include <DHT.h>
 #include <EEPROM.h>
+#include <LowPower.h>
 
 // P I N O U T S
 
@@ -19,10 +20,10 @@
 #define SOLAR_PIN A0
 #define SOLAR_DELAY 500000
 
-// FANS
-#define FAN1_PIN 5
-#define FAN2_PIN 10
-#define FAN3_PIN 6
+// FANS 5, 6, 9, 10
+#define FAN1_PIN 6
+#define FAN2_PIN 5
+#define FAN3_PIN 10
 #define FAN4_PIN 9
 
 // DISPLAY
@@ -78,7 +79,18 @@ int lastButtonState = LOW;  //
 unsigned long lastDebounceTime = 0;  // the last time the output pin was toggled
 constexpr unsigned long debounceDelay = 50;
 
-int encLastState;
+enum encoderDirectionType
+{
+    CW,
+    CCW
+};
+
+volatile int encCnt = 0;
+int encCntLast = 0;
+encoderDirectionType encDir = CW;
+unsigned long encLastIncTime = micros();
+unsigned long encLastDecTime = micros();
+unsigned long encPauseLength = 25000;
 
 int setHumidity;
 int setTemperature;
@@ -113,7 +125,7 @@ void beginDisplay();
 int getTextWidth(const char* text);
 int getTextHeight(const char* text);
 int updateEditMode();
-int updateEncoder();
+void updateEncoder();
 void updateDHT();
 void displayTitle(const char* title);
 void displayFanTitle(int fan);
@@ -127,43 +139,64 @@ int updatePowerOptionBackward(int option);
 void displayPowerOption(int option);
 void updateSolar();
 int average(const int samples[MAX_SAMPLES]);
+void initializeDefaultSettings();
+void readSettings();
+void writeSettings();
+
+void readEncoder()
+{
+    // Encoder interrupt routine for both pins. Updates counter
+    // if they are valid and have rotated a full indent.
+
+    static uint8_t old_AB = 3; // Lookup table index
+    static int8_t  encval = 0; // Encoder value
+    static const int8_t  enc_states[] = {0,-1,1,0,1,0,0,-1,-1,0,0,1,0,1,-1,0};
+
+    old_AB <<= 2; // Remember previous state
+
+    if (digitalRead(ENC_CLK_PIN)) old_AB |= 0x02; // Add current state of pin A
+    if (digitalRead(ENC_DT_PIN)) old_AB |= 0x01; // Add current state of pin B
+
+    encval += enc_states[(old_AB & 0x0F)];
+
+    // Update counter if encoder has rotated a full indent, this is at least 4 steps
+    if (encval > 3)
+    {
+        encDir = CW;
+
+        int changeValue = 1;
+        if ((micros() - encLastIncTime) < encPauseLength)
+        {
+            changeValue = 10 * changeValue;
+        }
+
+        encLastIncTime = micros();
+        encCnt = encCnt + changeValue;
+        encval = 0;
+    }
+    else if (encval < -3)
+    {
+        encDir = CCW;
+
+        int changeValue = -1;
+        if ((micros() - encLastDecTime) < encPauseLength)
+        {
+            changeValue = 10 * changeValue;
+        }
+
+        encLastDecTime = micros();
+        encCnt = encCnt + changeValue;
+        encval = 0;
+    }
+}
 
 void setup()
 {
     currentScreen = SCRN_TEMP;
 
-    int id;
-    EEPROM.get(GUID_ADDR, id);
+    initializeDefaultSettings();
 
-    // Set defaults if not initialized yet
-    if (id != GUID)
-    {
-        EEPROM.put(0, GUID);
-        EEPROM.write(TEMPERATURE_ADDR, 78);
-        EEPROM.write(HUMIDITY_ADDR, 85);
-        EEPROM.write(SOLAR_ADDR, 30);
-        EEPROM.write(FAN_1_ADDR, FAN_AUTO);
-        EEPROM.write(FAN_2_ADDR, FAN_AUTO);
-        EEPROM.write(FAN_3_ADDR, FAN_AUTO);
-        EEPROM.write(FAN_4_ADDR, FAN_AUTO);
-        EEPROM.write(POWER_ADDR, POWER_ON);
-    }
-
-    setTemperature = min(EEPROM.read(TEMPERATURE_ADDR), 99);
-    setHumidity = min(EEPROM.read(HUMIDITY_ADDR), 99);
-    setSolar = min(EEPROM.read(SOLAR_ADDR), 99);
-
-    fan1Option = EEPROM.read(FAN_1_ADDR);
-    fan1Option = (fan1Option > 2) ? 2 : fan1Option;
-    fan2Option = EEPROM.read(FAN_2_ADDR);
-    fan2Option = (fan2Option > 2) ? 2 : fan2Option;
-    fan3Option = EEPROM.read(FAN_3_ADDR);
-    fan3Option = (fan3Option > 2) ? 2 : fan3Option;
-    fan4Option = EEPROM.read(FAN_4_ADDR);
-    fan4Option = (fan4Option > 2) ? 2 : fan4Option;
-
-    powerOption = EEPROM.read(POWER_ADDR);
-    powerOption = (powerOption > 2) ? 2 : powerOption;
+    readSettings();
 
     lastTemperature = 0;
     lastHumidity = 0;
@@ -174,8 +207,8 @@ void setup()
     Serial.begin(9600);
 
     // Initialize PIN configurations
-    pinMode(ENC_CLK_PIN, INPUT);
-    pinMode(ENC_DT_PIN, INPUT);
+    attachInterrupt(digitalPinToInterrupt(ENC_CLK_PIN), readEncoder, CHANGE); // ENC_A
+    attachInterrupt(digitalPinToInterrupt(ENC_DT_PIN), readEncoder, CHANGE);  // ENC_B
     pinMode(ENC_SW_PIN, INPUT_PULLUP);
 
     pinMode(FAN1_PIN, OUTPUT);
@@ -209,14 +242,12 @@ void setup()
     solarIndex = 0;
     for (int & solarSample : solarSamples)
         solarSample = currentSolar;
-
-    encLastState = digitalRead(ENC_CLK_PIN);
 }
 
 void loop()
 {
     int reading = updateEditMode();
-    int encState = updateEncoder();
+    updateEncoder();
     updateDHT();
     updateSolar();
 
@@ -282,20 +313,70 @@ void loop()
 
     }
 
+    display.display();
+
     updateFans(FAN1_PIN, fan1Option);
     updateFans(FAN2_PIN, fan2Option);
     updateFans(FAN3_PIN, fan3Option);
     updateFans(FAN4_PIN, fan4Option);
 
     lastButtonState = reading;
-    encLastState = encState;
+}
 
-    display.display();
+void initializeDefaultSettings()
+{
+    int id;
+    EEPROM.get(GUID_ADDR, id);
+
+    // Set defaults if not initialized yet
+    if (id != GUID)
+    {
+        EEPROM.put(0, GUID);
+        EEPROM.write(TEMPERATURE_ADDR, 78);
+        EEPROM.write(HUMIDITY_ADDR, 85);
+        EEPROM.write(SOLAR_ADDR, 30);
+        EEPROM.write(FAN_1_ADDR, FAN_AUTO);
+        EEPROM.write(FAN_2_ADDR, FAN_AUTO);
+        EEPROM.write(FAN_3_ADDR, FAN_AUTO);
+        EEPROM.write(FAN_4_ADDR, FAN_AUTO);
+        EEPROM.write(POWER_ADDR, POWER_ON);
+    }
+}
+
+void readSettings()
+{
+    setTemperature = min(EEPROM.read(TEMPERATURE_ADDR), 99);
+    setHumidity = min(EEPROM.read(HUMIDITY_ADDR), 99);
+    setSolar = min(EEPROM.read(SOLAR_ADDR), 99);
+
+    fan1Option = EEPROM.read(FAN_1_ADDR);
+    fan1Option = (fan1Option > 2) ? 2 : fan1Option;
+    fan2Option = EEPROM.read(FAN_2_ADDR);
+    fan2Option = (fan2Option > 2) ? 2 : fan2Option;
+    fan3Option = EEPROM.read(FAN_3_ADDR);
+    fan3Option = (fan3Option > 2) ? 2 : fan3Option;
+    fan4Option = EEPROM.read(FAN_4_ADDR);
+    fan4Option = (fan4Option > 2) ? 2 : fan4Option;
+
+    powerOption = EEPROM.read(POWER_ADDR);
+    powerOption = (powerOption > 2) ? 2 : powerOption;
+}
+
+void writeSettings()
+{
+    EEPROM.write(TEMPERATURE_ADDR, static_cast<uint8_t>(setTemperature));
+    EEPROM.write(HUMIDITY_ADDR, static_cast<uint8_t>(setHumidity));
+    EEPROM.write(SOLAR_ADDR, static_cast<uint8_t>(setSolar));
+    EEPROM.write(FAN_1_ADDR, static_cast<uint8_t>(fan1Option));
+    EEPROM.write(FAN_2_ADDR, static_cast<uint8_t>(fan2Option));
+    EEPROM.write(FAN_3_ADDR, static_cast<uint8_t>(fan3Option));
+    EEPROM.write(FAN_4_ADDR, static_cast<uint8_t>(fan4Option));
+    EEPROM.write(POWER_ADDR, static_cast<uint8_t>(powerOption));
 }
 
 void updateFans(int fan, int option)
 {
-    if ((powerOption == POWER_OFF) || (powerOption == POWER_SOLAR && currentSolar < setSolar))
+    if ((powerOption == POWER_OFF) || (powerOption == POWER_SOLAR && currentSolar <= setSolar))
     {
         digitalWrite(fan, LOW);
         return;
@@ -317,34 +398,47 @@ void updateFans(int fan, int option)
 
 void displayValues(int lastValue, int currentValue, int setValue)
 {
-    // Set the text size and color for displaying temperature and humidity values
-    display.setTextSize(3);
-    display.setTextColor(SSD1306_WHITE);
+    currentValue = (currentValue < 0) ? 0 : (currentValue > 140) ? 140 : currentValue;
+    setValue = (setValue < 0) ? 0 : (setValue > 100) ? 100 : setValue;
 
     // Easy way to figure where to center text based on largest numbers
     const char* oneDigits = "0";
     const char* twoDigits = "00";
     const char* threeDigits = "100";
-    const char* numText = (lastValue < 10) ? oneDigits : (lastValue < 100) ? twoDigits : threeDigits;
+    const char* numText = oneDigits;
+
+    // Set the text size and color for displaying temperature and humidity values
+    display.setTextSize(3);
+    display.setTextColor(SSD1306_WHITE);
+
+    numText = (currentValue < 10) ? oneDigits : (currentValue < 100) ? twoDigits : threeDigits;
 
     // Get the text extents
     int width = getTextWidth(numText);
     int height = getTextHeight(numText);
 
     // Figure where center is positioned
-    int x = ((display.width() / 2) - width) / 2;
-    int y = ((SCREEN_BOTTOM-height) / 2) + SCREEN_TOP + 1;
+    int x = (((display.width() / 2) - width) / 2) ;
+    int y = ((SCREEN_BOTTOM-height) / 2) + SCREEN_TOP + 2;
+
+    char buf[5];
 
     // Display the LEFT value centered
     display.setCursor(x, y);
-    display.print(currentValue);
+    display.print(itoa(currentValue,buf,10));
 
     // Line between two numbers
     display.drawLine(display.width()/2, SCREEN_TOP+1, display.width()/2, display.height()-1, SSD1306_WHITE);
 
+    numText = (setValue < 10) ? oneDigits : (setValue < 100) ? twoDigits : threeDigits;
+
+    // Get the text extents
+    width = getTextWidth(numText);
+    x = (((display.width() / 2) - width) / 2) ;
+
     // Display the RIGHT value centered
     display.setCursor(x + display.width()/2, y);
-    display.print(setValue);
+    display.print(itoa(setValue,buf,10));
 }
 
 void displayPowerOption(int option)
@@ -454,6 +548,7 @@ void updateSolar()
     // We only want to update the temperature and humidity when the sensor is ready.
     if (thisMicros - lastReading > SOLAR_DELAY || thisMicros < lastReading)
     {
+        // Average the current sample to prevent jitter
         currentSolar = static_cast<int>(static_cast<float>(analogRead(SOLAR_PIN)) / 20.46f) * 2;
         solarIndex = (solarIndex + 1 >= MAX_SAMPLES) ? 0 : solarIndex + 1;
         solarSamples[solarIndex] = currentSolar;
@@ -483,6 +578,7 @@ void updateDHT()
             lastTemperature = static_cast<int>(currentTemperature);
             currentTemperatureInt = static_cast<int>(dht.convertCtoF(currentTemperature));
 
+            // Average the current sample to prevent jitter
             temperatureIndex = (temperatureIndex + 1 >= MAX_SAMPLES) ? 0 : temperatureIndex + 1;
             temperatureSamples[temperatureIndex] = currentTemperatureInt;
             currentTemperatureInt = average(temperatureSamples);
@@ -498,17 +594,13 @@ void updateDHT()
     }
 }
 
-int updateEncoder()
+void updateEncoder()
 {
-    // Check if the encoder dial is being turned in any direction
-    int encState = digitalRead(ENC_CLK_PIN);
-    if (encState != encLastState)
+    // The encoder shaft was moved
+    if (encCnt != encCntLast)
     {
-        // If the outputB state is different to the outputA state, that means the encoder is rotating clockwise
-        if (digitalRead(ENC_DT_PIN) != encState)
+        if (encDir == CW)
         {
-            Serial.println("CW");
-
             if (!editMode)
             {
                 // When not in edit mode, advance to the next screen
@@ -525,43 +617,33 @@ int updateEncoder()
                 {
                     case SCRN_TEMP:
                         setTemperature = (setTemperature == 99) ? 99 : setTemperature + 1;
-                        EEPROM.write(TEMPERATURE_ADDR, static_cast<uint8_t>(setTemperature));
                         break;
                     case SCRN_HUMIDITY:
                         setHumidity = (setHumidity == 99) ? 99 : setHumidity + 1;
-                        EEPROM.write(HUMIDITY_ADDR, static_cast<uint8_t>(setHumidity));
                         break;
                     case SCRN_SOLAR:
                         setSolar = (setSolar == 99) ? 99 : setSolar + 1;
-                        EEPROM.write(SOLAR_ADDR, static_cast<uint8_t>(setSolar));
                         break;
                     case SCRN_FAN1:
                         fan1Option = updateFanOptionForward(fan1Option);
-                        EEPROM.write(FAN_1_ADDR, static_cast<uint8_t>(fan1Option));
                         break;
                     case SCRN_FAN2:
                         fan2Option = updateFanOptionForward(fan2Option);
-                        EEPROM.write(FAN_2_ADDR, static_cast<uint8_t>(fan2Option));
                         break;
                     case SCRN_FAN3:
                         fan3Option = updateFanOptionForward(fan3Option);
-                        EEPROM.write(FAN_3_ADDR, static_cast<uint8_t>(fan3Option));
                         break;
                     case SCRN_FAN4:
                         fan4Option =updateFanOptionForward(fan4Option);
-                        EEPROM.write(FAN_4_ADDR, static_cast<uint8_t>(fan4Option));
                         break;
                     case SCRN_POWER:
                         powerOption = updatePowerOptionForward(powerOption);
-                        EEPROM.write(POWER_ADDR, static_cast<uint8_t>(powerOption));
                         break;
                 }
             }
         }
-        else
+        else // CCW
         {
-            Serial.println("CCW");
-
             if (!editMode)
             {
                 // When not in edit mode, go to the prior screen
@@ -578,42 +660,34 @@ int updateEncoder()
                 {
                     case SCRN_TEMP:
                         setTemperature = (setTemperature <= 1) ? 1 : setTemperature - 1;
-                        EEPROM.write(TEMPERATURE_ADDR, static_cast<uint8_t>(setTemperature));
                         break;
                     case SCRN_HUMIDITY:
                         setHumidity = (setHumidity <= 1) ? 1 : setHumidity - 1;
-                        EEPROM.write(HUMIDITY_ADDR, static_cast<uint8_t>(setHumidity));
                         break;
                     case SCRN_SOLAR:
                         setSolar = (setSolar <= 1) ? 1 : setSolar - 1;
-                        EEPROM.write(SOLAR_ADDR, static_cast<uint8_t>(setSolar));
                         break;
                     case SCRN_FAN1:
                         fan1Option = updateFanOptionBackward(fan1Option);
-                        EEPROM.write(FAN_1_ADDR, static_cast<uint8_t>(fan1Option));
                         break;
                     case SCRN_FAN2:
                         fan2Option = updateFanOptionBackward(fan2Option);
-                        EEPROM.write(FAN_2_ADDR, static_cast<uint8_t>(fan2Option));
                         break;
                     case SCRN_FAN3:
                         fan3Option = updateFanOptionBackward(fan3Option);
-                        EEPROM.write(FAN_3_ADDR, static_cast<uint8_t>(fan3Option));
                         break;
                     case SCRN_FAN4:
                         fan4Option = updateFanOptionBackward(fan4Option);
-                        EEPROM.write(FAN_4_ADDR, static_cast<uint8_t>(fan4Option));
                         break;
                     case SCRN_POWER:
                         powerOption = updatePowerOptionBackward(powerOption);
-                        EEPROM.write(POWER_ADDR, static_cast<uint8_t>(powerOption));
                         break;
                 }
             }
         }
-    }
 
-    return encState;
+        encCntLast = encCnt;
+    }
 }
 
 int updateFanOptionForward(int option)
@@ -677,7 +751,13 @@ int updateEditMode()
 
             // Toggle the edit mode
             if (buttonState == LOW)
+            {
                 editMode = !editMode;
+
+                // When coming out of edit mode, save the users settings.
+                if (!editMode)
+                    writeSettings();
+            }
 
             Serial.println((editMode) ? "EDIT" : "DISPLAY");
         }
